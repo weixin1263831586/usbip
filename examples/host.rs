@@ -7,9 +7,15 @@ fn required_arg(args: &[String], name: &str) -> String {
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
         .unwrap_or_else(|| {
-            eprintln!("usage: host --vid HEX --pid HEX --serial SERIAL");
+            eprintln!("usage: host --vid HEX --pid HEX --serial SERIAL [--listen ADDR]");
             std::process::exit(2);
         })
+}
+
+fn optional_arg(args: &[String], name: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
 }
 
 fn parse_hex_u16(value: &str, name: &str) -> u16 {
@@ -23,9 +29,21 @@ fn parse_hex_u16(value: &str, name: &str) -> u16 {
 async fn main() {
     env_logger::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("usage: host --vid HEX --pid HEX --serial SERIAL [--listen ADDR]");
+        println!("default listen address: 0.0.0.0:3240");
+        return;
+    }
     let vid = parse_hex_u16(&required_arg(&args, "--vid"), "--vid");
     let pid = parse_hex_u16(&required_arg(&args, "--pid"), "--pid");
     let serial = required_arg(&args, "--serial");
+    let listen = optional_arg(&args, "--listen")
+        .unwrap_or_else(|| "0.0.0.0:3240".to_string())
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|err| {
+            eprintln!("invalid --listen address: {err}");
+            std::process::exit(2);
+        });
 
     let server = Arc::new(usbip::UsbIpServer::new_from_host_with_filter(
         move |device| {
@@ -42,8 +60,7 @@ async fn main() {
                 .is_ok_and(|device_serial| device_serial == serial)
         },
     ));
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3240);
-    tokio::spawn(usbip::server(addr, server));
+    tokio::spawn(usbip::server(listen, server));
 
     loop {
         // sleep 1s

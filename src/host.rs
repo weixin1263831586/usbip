@@ -5,11 +5,11 @@ use nusb::MaybeFuture;
 /// A handler to pass requests to interface of a rusb USB device of the host
 #[derive(Clone, Debug)]
 pub struct RusbUsbHostInterfaceHandler {
-    handle: Arc<Mutex<DeviceHandle<GlobalContext>>>,
+    handle: Arc<DeviceHandle<GlobalContext>>,
 }
 
 impl RusbUsbHostInterfaceHandler {
-    pub fn new(handle: Arc<Mutex<DeviceHandle<GlobalContext>>>) -> Self {
+    pub fn new(handle: Arc<DeviceHandle<GlobalContext>>) -> Self {
         Self { handle }
     }
 }
@@ -26,24 +26,25 @@ impl UsbInterfaceHandler for RusbUsbHostInterfaceHandler {
         debug!("To host device: ep={ep:?} setup={setup:?} req={req:?}",);
         let mut buffer = vec![0u8; transfer_buffer_length as usize];
         let timeout = std::time::Duration::new(1, 0);
-        let handle = self.handle.lock().unwrap();
+        let handle = &self.handle;
         if ep.attributes == EndpointAttributes::Control as u8 {
             // control
             if let Direction::In = ep.direction() {
                 // control in
-                if let Ok(len) = handle.read_control(
-                    setup.request_type,
-                    setup.request,
-                    setup.value,
-                    setup.index,
-                    &mut buffer,
-                    timeout,
-                ) {
-                    return Ok(Vec::from(&buffer[..len]));
-                }
+                let len = handle
+                    .read_control(
+                        setup.request_type,
+                        setup.request,
+                        setup.value,
+                        setup.index,
+                        &mut buffer,
+                        timeout,
+                    )
+                    .map_err(std::io::Error::other)?;
+                return Ok(Vec::from(&buffer[..len]));
             } else {
                 // control out
-                handle
+                let len = handle
                     .write_control(
                         setup.request_type,
                         setup.request,
@@ -52,30 +53,54 @@ impl UsbInterfaceHandler for RusbUsbHostInterfaceHandler {
                         req,
                         timeout,
                     )
-                    .ok();
+                    .map_err(std::io::Error::other)?;
+                if len != req.len() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::WriteZero,
+                        format!("short control write: {len}/{} bytes", req.len()),
+                    ));
+                }
             }
         } else if ep.attributes == EndpointAttributes::Interrupt as u8 {
             // interrupt
             if let Direction::In = ep.direction() {
                 // interrupt in
-                if let Ok(len) = handle.read_interrupt(ep.address, &mut buffer, timeout) {
-                    info!("intr in {:?}", &buffer[..len]);
-                    return Ok(Vec::from(&buffer[..len]));
-                }
+                let len = handle
+                    .read_interrupt(ep.address, &mut buffer, timeout)
+                    .map_err(std::io::Error::other)?;
+                info!("intr in {:?}", &buffer[..len]);
+                return Ok(Vec::from(&buffer[..len]));
             } else {
                 // interrupt out
-                handle.write_interrupt(ep.address, req, timeout).ok();
+                let len = handle
+                    .write_interrupt(ep.address, req, timeout)
+                    .map_err(std::io::Error::other)?;
+                if len != req.len() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::WriteZero,
+                        format!("short interrupt write: {len}/{} bytes", req.len()),
+                    ));
+                }
             }
         } else if ep.attributes == EndpointAttributes::Bulk as u8 {
             // bulk
             if let Direction::In = ep.direction() {
                 // bulk in
-                if let Ok(len) = handle.read_bulk(ep.address, &mut buffer, timeout) {
-                    return Ok(Vec::from(&buffer[..len]));
-                }
+                let len = handle
+                    .read_bulk(ep.address, &mut buffer, timeout)
+                    .map_err(std::io::Error::other)?;
+                return Ok(Vec::from(&buffer[..len]));
             } else {
                 // bulk out
-                handle.write_bulk(ep.address, req, timeout).ok();
+                let len = handle
+                    .write_bulk(ep.address, req, timeout)
+                    .map_err(std::io::Error::other)?;
+                if len != req.len() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::WriteZero,
+                        format!("short bulk write: {len}/{} bytes", req.len()),
+                    ));
+                }
             }
         }
         Ok(vec![])
@@ -93,11 +118,11 @@ impl UsbInterfaceHandler for RusbUsbHostInterfaceHandler {
 /// A handler to pass requests to device of a rusb USB device of the host
 #[derive(Clone, Debug)]
 pub struct RusbUsbHostDeviceHandler {
-    handle: Arc<Mutex<DeviceHandle<GlobalContext>>>,
+    handle: Arc<DeviceHandle<GlobalContext>>,
 }
 
 impl RusbUsbHostDeviceHandler {
-    pub fn new(handle: Arc<Mutex<DeviceHandle<GlobalContext>>>) -> Self {
+    pub fn new(handle: Arc<DeviceHandle<GlobalContext>>) -> Self {
         Self { handle }
     }
 }
@@ -112,11 +137,11 @@ impl UsbDeviceHandler for RusbUsbHostDeviceHandler {
         debug!("To host device: setup={setup:?} req={req:?}");
         let mut buffer = vec![0u8; transfer_buffer_length as usize];
         let timeout = std::time::Duration::new(1, 0);
-        let handle = self.handle.lock().unwrap();
+        let handle = &self.handle;
         // control
         if setup.request_type & 0x80 == 0 {
             // control out
-            handle
+            let len = handle
                 .write_control(
                     setup.request_type,
                     setup.request,
@@ -125,19 +150,26 @@ impl UsbDeviceHandler for RusbUsbHostDeviceHandler {
                     req,
                     timeout,
                 )
-                .ok();
+                .map_err(std::io::Error::other)?;
+            if len != req.len() {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    format!("short control write: {len}/{} bytes", req.len()),
+                ));
+            }
         } else {
             // control in
-            if let Ok(len) = handle.read_control(
-                setup.request_type,
-                setup.request,
-                setup.value,
-                setup.index,
-                &mut buffer,
-                timeout,
-            ) {
-                return Ok(Vec::from(&buffer[..len]));
-            }
+            let len = handle
+                .read_control(
+                    setup.request_type,
+                    setup.request,
+                    setup.value,
+                    setup.index,
+                    &mut buffer,
+                    timeout,
+                )
+                .map_err(std::io::Error::other)?;
+            return Ok(Vec::from(&buffer[..len]));
         }
         Ok(vec![])
     }

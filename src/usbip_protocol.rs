@@ -453,9 +453,30 @@ impl UsbIpResponse {
         transfer_buffer: Vec<u8>,
         iso_packet_descriptor: Vec<u8>,
     ) -> Self {
+        Self::usbip_ret_submit_result(
+            header,
+            0,
+            start_frame,
+            number_of_packets,
+            actual_length,
+            transfer_buffer,
+            iso_packet_descriptor,
+        )
+    }
+
+    /// Constructs USBIP_RET_SUBMIT with a Linux URB status value.
+    pub fn usbip_ret_submit_result(
+        header: &UsbIpHeaderBasic,
+        status: i32,
+        start_frame: u32,
+        number_of_packets: u32,
+        actual_length: u32,
+        transfer_buffer: Vec<u8>,
+        iso_packet_descriptor: Vec<u8>,
+    ) -> Self {
         Self::UsbIpRetSubmit {
             header: header.clone(),
-            status: 0,
+            status: status as u32,
             actual_length,
             start_frame,
             number_of_packets,
@@ -481,9 +502,14 @@ impl UsbIpResponse {
 
     /// Constructs a successful USBIP_RET_UNLINK response
     pub fn usbip_ret_unlink_success(header: &UsbIpHeaderBasic) -> Self {
+        Self::usbip_ret_unlink_result(header, 0)
+    }
+
+    /// Constructs USBIP_RET_UNLINK with a Linux URB status value.
+    pub fn usbip_ret_unlink_result(header: &UsbIpHeaderBasic, status: i32) -> Self {
         Self::UsbIpRetUnlink {
             header: header.clone(),
-            status: 0,
+            status: status as u32,
         }
     }
 

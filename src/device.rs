@@ -58,6 +58,16 @@ pub struct UsbDevice {
     #[cfg_attr(feature = "serde", serde(skip))]
     pub device_handler: Option<Arc<Mutex<Box<dyn UsbDeviceHandler + Send>>>>,
 
+    /// Reconnectable physical handle keyed by VID/PID and serial number.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) host_runtime: Option<Arc<crate::async_transfer::HostDeviceRuntime>>,
+
+    /// One queue per physical endpoint. ADB gadgets are sensitive to multiple
+    /// concurrent requests on the same bulk endpoint, while opposite endpoints
+    /// must remain concurrent (IN can wait while OUT carries a command).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) host_endpoint_locks: Option<Arc<HashMap<u8, Arc<tokio::sync::Semaphore>>>>,
+
     pub usb_version: Version,
 
     pub(crate) ep0_in: UsbEndpoint,
@@ -496,16 +506,14 @@ impl UsbDevice {
                     setup_packet.request_type,
                     FromPrimitive::from_u8(setup_packet.request),
                 ) {
-                    (0b00000000, Some(SetConfiguration)) => {
-                        let mut desc = vec![
-                            self.configuration_value, // bConfigurationValue
-                        ];
-
-                        // requested len too short: wLength < real length
-                        if setup_packet.length < desc.len() as u16 {
-                            desc.resize(setup_packet.length as usize, 0);
-                        }
-                        Ok(desc)
+                    (0b00000000, Some(SetConfiguration)) => Ok(vec![]),
+                    // The virtual host resets its endpoint state during enumeration.
+                    // Forwarding this directly to some Android gadgets makes them
+                    // disconnect and re-enumerate, invalidating the physical handle.
+                    (0b00000010, Some(ClearFeature))
+                        if setup_packet.value == 0 && setup_packet.length == 0 =>
+                    {
+                        Ok(vec![])
                     }
                     _ if setup_packet.request_type & 0xF == 1 => {
                         // to interface

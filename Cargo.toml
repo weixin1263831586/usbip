@@ -17,10 +17,10 @@ num-derive = "0.5.1"
 rusb = "0.9.3"
 serde = { version = "1.0", features = ["derive"], optional = true }
 nusb = "0.2.1"
+env_logger = "0.11.7"
 
 [dev-dependencies]
 tokio = { version = "1.22.0", features = ["full"] }
-env_logger = "0.11.7"
 
 [features]
 default = []

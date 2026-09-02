@@ -1,373 +1,226 @@
 # usbip
 
-[![Coverage Status](https://coveralls.io/repos/github/jiegec/usbip/badge.svg?branch=master)](https://coveralls.io/github/jiegec/usbip?branch=master)
-[![crates.io](https://img.shields.io/crates/v/usbip.svg)](https://crates.io/crates/usbip)
-[![Documentation](https://docs.rs/usbip/badge.svg)](https://docs.rs/usbip)
+一个使用 Rust 编写的用户态 USB/IP 服务端，支持将物理 USB 设备通过网络转发给另一台 Linux 主机。
 
-一个用于运行 USB/IP 服务端的 Rust 库。它既可以导出模拟 USB 设备，也可以把服务端物理 USB 设备的传输请求转发到网络客户端。
+## 工作原理
 
-## USB/IP 是什么
+本项目负责服务端，客户端仍使用 Ubuntu 系统自带的 USB/IP 工具：
 
-USB/IP 通过 TCP 传输 USB 设备操作。远程客户端可以发现本项目导出的设备，并把它挂载成本机 USB 设备来使用。
+```text
+服务端物理 USB
+      ↓
+本项目通过 libusb 打开并 claim USB 接口
+      ↓
+usbipd 通过 TCP 3240 转发 USB 请求
+      ↓
+客户端 vhci-hcd 创建虚拟 USB
+      ↓
+客户端系统、ADB 或其他程序使用该 USB 设备
+```
 
-本项目支持：
+Ubuntu 原生的 `usbip-host.ko` 并不是完全不能导出 USB，键盘、鼠标等简单设备通常可以正常工作。但 Android 手机、开发板等复合 Gadget 设备包含 ADB、MTP、PTP 等多个接口，被内核 `usbip-host` 接管时可能断开并重新枚举，导致设备从 exportable 列表消失。
 
-- 模拟 HID 键盘和 CDC ACM 串口设备；
-- 将控制传输、Bulk 传输和 Interrupt 传输转发到物理 USB 设备；
-- 处理 USB/IP \`CMD_UNLINK\` 请求，并取消对应的物理 USB 传输；
-- 物理设备重新枚举后，在序列号不变时自动重新连接；
-- 通过 Tokio 异步 API 集成到其他 Rust 应用中。
+本项目使用用户态 libusb 转发，不让 `usbip-host.ko` 接管整个物理设备，因此更适合 Android 设备。客户端仍然需要 `vhci-hcd`，这两者不是同一个实现。
 
-本项目实现的是 USB/IP 服务端，不提供独立的 \`usbip\` 命令行客户端程序。Linux 客户端需要使用系统自带的 USB/IP 工具。
+## 两台主机的角色
 
-## 工作模式
-
-USB/IP 使用时涉及两台机器：
-
-| 角色 | 作用 |
+| 主机 | 操作 |
 | --- | --- |
-| USB 主机 / 服务端 | 物理 USB 设备插在这台机器上，运行本项目的 \`host\` 程序。 |
-| USB 客户端 | 运行 \`usbip attach\`，把远程设备挂载到本机。 |
+| USB 服务端 | 设备实际插在这台机器上，运行 `usbipd bind` |
+| USB 客户端 | 运行 `usbip list`、`usbip attach`，使用远程设备 |
 
-对于 Android 设备，通常需要先停止占用 USB 设备的 ADB 服务，再启动 USB/IP 服务端。
+以下示例中：
 
-## 环境要求
+- 服务端：`172.16.14.246`
+- 客户端：`172.16.14.233`
+- 设备：VID `2207`、PID `0006`
 
-安装 Rust：[官方安装说明](https://www.rust-lang.org/tools/install)。本项目使用 Rust edition 2024。
+## 服务端使用
 
-转发物理 USB 设备时，服务端必须能通过 libusb 打开并 claim 设备接口。Linux 下可以使用 udev 规则授权，也可以暂时使用 root 权限运行。
+### 1. 安装 usbipd
 
-客户端需要操作系统提供 USB/IP 支持。Linux 客户端需要安装 \`usbip\` 工具，并加载 \`vhci-hcd\` 内核模块。
+#### 一键安装
 
-本项目通过用户态 libusb 直接访问物理设备，因此服务端不需要把设备绑定到内核的 \`usbip-host\` 驱动。
+在 Linux x86_64 主机上，可以直接下载 GitHub Releases 中的预编译文件：
 
-## 快速开始：Android 或其他物理 USB 设备
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/weixin1263831586/usbip/master/install.sh | sh
+```
 
-以下命令都在“USB 设备实际插入的那台机器”上执行。
+脚本只下载 GitHub Releases 中由 `target/release/usbipd` 生成的预编译文件，校验通过后安装到 `/usr/local/bin/usbipd`，不会拉取源码或现场编译。
 
-### 1. 编译服务端程序
+#### 手动安装编译结果
 
-在项目根目录执行：
+如果已经在项目目录编译出 `target/release/usbipd`，直接安装：
 
-\`\`\`bash
-cargo build --release --example host
-\`\`\`
+```bash
+cargo build --release --bin usbipd
+sudo install -m 0755 target/release/usbipd /usr/local/bin/usbipd
+usbipd --version
+```
 
-### 2. 启动服务端
+以后直接使用 `usbipd`，不需要再输入构建目录中的路径。
 
-推荐使用项目自带的启动脚本。它会自动定位 release binary，并且不再需要手写很长的 \`sudo bash -lc\` 命令：
+项目维护者发布新版本时，创建并推送版本 tag：
 
-\`\`\`bash
-./scripts/usbip-host.sh \
+```bash
+git tag v0.9.1
+git push origin v0.9.1
+```
+
+GitHub Actions 会自动编译 `target/release/usbipd`，并将 `usbipd-linux-x86_64` 和校验文件上传到对应 Release。
+
+### 2. 查询设备序列号
+
+```bash
+lsusb
+lsusb -v -d 2207:0006 2>/dev/null | grep -E 'iManufacturer|iProduct|iSerial'
+```
+
+序列号必须填写当前 USB 描述符实际返回的值。设备重新枚举后，序列号或 BUSID 可能变化。
+
+### 3. 启动服务
+
+Android 设备推荐使用：
+
+```bash
+usbipd bind \
+  --stop-adb \
   --vid 2207 \
   --pid 0006 \
-  --serial bb41e7b689aba45
-\`\`\`
+  --serial YOUR_USB_SERIAL
+```
 
-其中：
+参数说明：
 
-- \`--vid\`：USB Vendor ID，十六进制；
-- \`--pid\`：USB Product ID，十六进制；
-- \`--serial\`：USB 序列号，必须与设备上报的序列号完全一致；
-- 默认监听地址为 \`0.0.0.0:3240\`。
+- `--serial`：必填，选择要导出的设备；
+- `--vid`、`--pid`：可选，用于进一步限制设备；
+- `--stop-adb`：先停止当前用户的 ADB；
+- 默认监听 `0.0.0.0:3240`；
+- 按 `Ctrl-C` 停止服务。
 
-如果 ADB 服务占用了设备，可以使用 \`--stop-adb\`：
+如果 CTS、GMS Worker 或其他后台任务会自动启动 ADB，单次 `--stop-adb` 可能不够，需要先暂停会自动拉起 ADB 的任务。
 
-\`\`\`bash
-./scripts/usbip-host.sh --stop-adb \
-  --vid 2207 \
-  --pid 0006 \
-  --serial bb41e7b689aba45
-\`\`\`
+如果看到：
 
-这个选项执行的是 \`adb kill-server\`，不会永久关闭 ADB。USB/IP 设备卸载后，如需恢复本地 ADB，可以执行：
+```text
+cannot connect to daemon at tcp:5037: Connection refused
+```
 
-\`\`\`bash
-adb start-server
-\`\`\`
+表示 ADB 本来就没有运行，可以忽略，USB/IP 服务仍会继续启动。
 
-### 3. 使用环境变量保存设备信息
+## Linux 客户端使用
 
-如果经常使用同一个设备，可以不用每次重复输入参数：
+### 1. 安装并加载客户端组件
 
-\`\`\`bash
-export USBIP_VID=2207
-export USBIP_PID=0006
-export USBIP_SERIAL=bb41e7b689aba45
-
-./scripts/usbip-host.sh --stop-adb
-\`\`\`
-
-也可以设置监听地址：
-
-\`\`\`bash
-export USBIP_LISTEN=0.0.0.0:3241
-./scripts/usbip-host.sh
-\`\`\`
-
-如果项目不在当前目录，或者 release binary 在其他位置，可以设置：
-
-\`\`\`bash
-USBIP_HOST_BIN=/home/wlq/usbip/target/release/examples/host \
-  ./scripts/usbip-host.sh --stop-adb \
-  --vid 2207 --pid 0006 --serial bb41e7b689aba45
-\`\`\`
-
-### 4. 直接运行 binary
-
-启动脚本只是为了方便，也可以直接运行：
-
-\`\`\`bash
-sudo /path/to/usbip/target/release/examples/host \
-  --vid 2207 \
-  --pid 0006 \
-  --serial bb41e7b689aba45
-\`\`\`
-
-完整参数说明：
-
-\`\`\`bash
-./scripts/usbip-host.sh --help
-
-# 或
-cargo run --example host -- --help
-\`\`\`
-
-## 免 sudo 运行
-
-\`sudo\` 不是 USB/IP 本身的要求，只是因为当前用户可能没有访问 USB 设备节点的权限。
-
-Linux 下可以为指定设备添加 udev 规则：
-
-\`\`\`bash
-sudo tee /etc/udev/rules.d/70-usbip-android.rules >/dev/null <<'EOF'
-SUBSYSTEM=="usb", ATTR{idVendor}=="2207", ATTR{idProduct}=="0006", ATTR{serial}=="bb41e7b689aba45", TAG+="uaccess"
-EOF
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-\`\`\`
-
-拔出并重新插入设备后，使用普通用户运行：
-
-\`\`\`bash
-./scripts/usbip-host.sh --no-sudo \
-  --vid 2207 \
-  --pid 0006 \
-  --serial bb41e7b689aba45
-\`\`\`
-
-如果是 systemd 服务，建议使用专用用户组，并在 udev 规则中使用 \`GROUP="usbip"\` 和 \`MODE="0660"\`。\`TAG+="uaccess"\` 主要适用于当前有登录会话的普通用户。
-
-## Linux 客户端连接
-
-以下命令在需要使用远程 USB 设备的客户端机器上执行。
-
-### 1. 加载客户端内核模块
-
-\`\`\`bash
-sudo modprobe vhci-hcd
-\`\`\`
+```bash
+sudo apt update
+sudo apt install usbip linux-tools-generic linux-cloud-tools-generic -y
+sudo modprobe vhci_hcd
+```
 
 ### 2. 查询服务端设备
 
-假设服务端 IP 是 \`192.168.1.10\`：
+```bash
+usbip list -r 172.16.14.246
+```
 
-\`\`\`bash
-usbip list --remote 192.168.1.10
-\`\`\`
+输出示例：
 
-输出中会包含类似 \`1-2-1\` 的 \`BUSID\`。
+```text
+1-17-13: Fuzhou Rockchip Electronics Company : unknown product (2207:0006)
+```
 
-### 3. 挂载远程设备
+这里的 `1-17-13` 是当前 BUSID。设备重新枚举后可能变成 `1-18-13`，每次挂载前都要重新查询。
 
-\`\`\`bash
-sudo usbip attach \
-  --remote 192.168.1.10 \
-  --busid 1-2-1
-\`\`\`
+### 3. 挂载设备
 
-如果服务端和客户端在同一台机器上：
+```bash
+sudo usbip attach -r 172.16.14.246 -b 1-17-13
+```
 
-\`\`\`bash
-usbip list --remote 127.0.0.1
-sudo usbip attach --remote 127.0.0.1 --busid 1-2-1
-\`\`\`
+`attach` 成功时通常没有输出。它只提交挂载请求，客户端内核还需要异步完成 USB 枚举，ADB 也需要再次轮询设备。因此第一次执行 `adb devices` 看不到设备是正常的，等待几秒后再检查：
 
-挂载成功后，设备会出现在客户端系统中，可以像本地 USB 设备一样使用。
-
-### 4. 查看和卸载设备
-
-查看当前挂载端口：
-
-\`\`\`bash
-usbip port
-\`\`\`
-
-卸载设备：
-
-\`\`\`bash
-sudo usbip detach --port PORT
-\`\`\`
-
-服务端默认监听 TCP \`3240\` 端口。跨机器使用时，需要确保服务端防火墙允许该端口访问。
-
-## 其他示例
-
-项目提供三个可运行示例：
-
-| 示例 | 说明 |
-| --- | --- |
-| \`hid_keyboard\` | 导出一个模拟 HID 键盘，每秒发送一次按键 \`1\`。 |
-| \`cdc_acm_serial\` | 导出一个模拟 CDC ACM 串口设备，每秒发送一次字符 \`a\`。 |
-| \`host\` | 按 VID、PID 和序列号导出一个物理 USB 设备。 |
-
-所有示例默认监听 \`0.0.0.0:3240\`。
-
-启动模拟 HID 键盘：
-
-\`\`\`bash
-cargo run --example hid_keyboard
-\`\`\`
-
-启动模拟 CDC ACM 串口：
-
-\`\`\`bash
-cargo run --example cdc_acm_serial
-\`\`\`
-
-直接启动物理设备示例：
-
-\`\`\`bash
-cargo run --example host -- \
-  --vid 0x18d1 \
-  --pid 0x4ee7 \
-  --serial YOUR_SERIAL
-\`\`\`
-
-修改监听地址或端口：
-
-\`\`\`bash
-cargo run --example host -- \
-  --vid 0x18d1 \
-  --pid 0x4ee7 \
-  --serial YOUR_SERIAL \
-  --listen 0.0.0.0:3241
-\`\`\`
-
-使用 \`lsusb\` 可以查看 USB 设备信息：
-
-\`\`\`bash
+```bash
+sudo usbip port
 lsusb
-\`\`\`
+adb devices
+```
 
-## 在其他 Rust 项目中使用
+确认设备状态为 `device` 后即可使用：
 
-在 \`Cargo.toml\` 中添加依赖：
+```bash
+adb shell
+```
 
-\`\`\`toml
-[dependencies]
-usbip = "0.9"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
-\`\`\`
+客户端 ADB 显示的设备 ID 不一定等于服务端 `--serial`，两者不需要相同。
 
-\`serde\` 是可选 feature，可以为公开的 USB 描述符和协议类型启用序列化支持：
+### 4. 卸载设备
 
-\`\`\`toml
-usbip = { version = "0.9", features = ["serde"] }
-\`\`\`
+先查看端口：
 
-最小服务端示例：
+```bash
+sudo usbip port
+```
 
-\`\`\`rust,no_run
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+再卸载对应端口：
 
-#[tokio::main]
-async fn main() {
-    let devices = vec![usbip::UsbDevice::new(0)];
-    let server = Arc::new(usbip::UsbIpServer::new_simulated(devices));
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3240);
+```bash
+sudo usbip detach -p 1
+```
 
-    usbip::server(address, server).await;
-}
-\`\`\`
+## 权限说明
 
-自定义模拟设备时，可以使用 \`UsbDevice::with_interface\` 添加接口和端点，并实现 \`UsbInterfaceHandler\`。\`hid\` 和 \`cdc\` 模块中包含完整的处理器示例。
+服务端不一定需要 `sudo`。只要当前用户有权限访问 `/dev/bus/usb/*`，即可直接运行 `usbipd bind`。没有权限时，最简单的方式是：
 
-## 物理设备行为说明
+```bash
+sudo usbipd bind --vid 2207 --pid 0006 --serial YOUR_SERIAL
+```
 
-服务端创建时会打开物理设备并 claim 其接口。USB 传输以异步方式转发，客户端发起 unlink 请求时会取消对应的 libusb 传输。
-
-设备重新枚举后，Linux 可能会给它分配新的设备地址；某些设备在模式切换时还可能改变 PID。只要设备序列号保持不变，服务端就会通过 VID 和序列号查找并重新 claim 新设备。
-
-没有序列号的设备会退回使用原始 VID/PID 进行匹配。
-
-一个导出设备同时只能被一个客户端连接使用。客户端断开后，设备会回到服务端的可用设备列表中。
-
-保持服务端进程持续运行，才能在物理设备重新枚举后自动重新连接。
-
-## 使用 systemd 常驻运行
-
-如果服务端需要开机自动启动，建议使用 systemd，而不是手工维护一条很长的 shell 命令。下面是示例配置，请根据实际路径和设备信息修改：
-
-\`\`\`ini
-# /etc/systemd/system/usbip-host.service
-[Unit]
-Description=USB/IP 物理 USB 设备服务端
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/opt/usbip/target/release/examples/host --vid 2207 --pid 0006 --serial bb41e7b689aba45
-Restart=on-failure
-RestartSec=1
-
-# 配置好 udev 规则后，可以改成有 USB 权限的普通用户。
-User=root
-
-[Install]
-WantedBy=multi-user.target
-\`\`\`
-
-启用服务：
-
-\`\`\`bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now usbip-host.service
-sudo systemctl status usbip-host.service
-\`\`\`
-
-查看实时日志：
-
-\`\`\`bash
-journalctl -u usbip-host.service -f
-\`\`\`
+客户端的 `modprobe`、`attach` 和 `detach` 通常需要 `sudo`，因为它们需要操作内核的 `vhci-hcd`。
 
 ## 常见问题
 
-- **没有导出设备：** 先执行 \`lsusb\`，确认 VID、PID 和序列号。序列号比较区分大小写，并且必须完全匹配。
-- **出现 \`Permission denied\` 或 claim interface 失败：** 添加 udev 规则，或者先使用启动脚本默认的 sudo 模式。
-- **设备被占用：** 停止正在使用该设备的进程。Android 设备可以使用 \`adb kill-server\` 或启动脚本的 \`--stop-adb\`。
-- **客户端查询不到设备：** 检查服务端是否监听 TCP \`3240\`、防火墙是否放行，以及客户端是否加载了 \`vhci-hcd\`。
-- **提示地址已被占用：** 停止之前的 host 进程，或者传入不同的 \`--listen ADDR\`；同一个地址和端口只能被一个进程监听。
-- **设备重新枚举后 BUSID 变化：** 不要重启服务端进程。只要序列号稳定，服务端会根据序列号重新寻找设备。
-- **\`adb kill-server\` 后仍然占用设备：** 检查是否有 root 用户启动的 ADB 进程，必要时执行 \`sudo pkill -x adb\`，然后重新启动 USB/IP 服务端。
+### `no exportable devices found`
 
-## 从源码构建
+服务端没有找到可导出的匹配设备，依次检查：
 
-\`\`\`bash
-git clone https://github.com/jiegec/usbip.git
-cd usbip
-cargo build --release
-\`\`\`
+1. `--serial`、VID、PID 是否正确；
+2. ADB 或其他程序是否占用了设备；
+3. 服务端用户是否有 USB 设备节点权限；
+4. 是否启动了旧的 `usbipd`，占用了 3240 端口。
 
-运行测试：
+### `attach` 没有输出，ADB 暂时看不到
 
-\`\`\`bash
+这是 USB 异步枚举延时。先执行 `sudo usbip port` 和 `lsusb`，等待几秒后再执行 `adb devices`。如果 BUSID 已变化，重新执行 `usbip list -r SERVER_IP`。
+
+### 设备连接后又掉线
+
+优先检查服务端是否有 ADB、CTS、GMS Worker 或其他程序重新抢占设备。Android 设备发生模式切换时，也可能改变 PID、序列号或 BUSID，需要重新查询后启动服务。
+
+### `Address already in use`
+
+说明 3240 已经被其他 `usbipd` 或旧的 `host` 进程占用。停止旧进程，或者指定其他监听地址：
+
+```bash
+usbipd bind --listen 0.0.0.0:3241 --serial YOUR_SERIAL
+```
+
+客户端使用对应端口：
+
+```bash
+sudo usbip attach -r 172.16.14.246 -b BUSID
+```
+
+## 开发
+
+```bash
 cargo test
-\`\`\`
+cargo fmt --check
+```
+
+项目也保留模拟 HID 和 CDC ACM 设备示例，可用于测试 USB/IP 协议本身。
 
 ## 许可证
 

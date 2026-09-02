@@ -1,0 +1,40 @@
+name: Release usbipd
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev pkg-config
+
+      - name: Build usbipd
+        run: cargo build --locked --release --bin usbipd
+
+      - name: Prepare release files
+        run: |
+          cp target/release/usbipd usbipd-linux-x86_64
+          sha256sum usbipd-linux-x86_64 > usbipd-linux-x86_64.sha256
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            usbipd-linux-x86_64 \
+            usbipd-linux-x86_64.sha256 \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

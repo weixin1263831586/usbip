@@ -4,7 +4,7 @@ set -Eeuo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "$script_dir/.." && pwd)"
 
-host_bin="${USBIP_HOST_BIN:-$project_dir/target/release/examples/host}"
+host_bin="${USBIP_HOST_BIN:-$project_dir/target/release/usbipd}"
 vid="${USBIP_VID:-}"
 pid="${USBIP_PID:-}"
 serial="${USBIP_SERIAL:-}"
@@ -26,7 +26,7 @@ Options:
   --help             Show this help
 
 Environment:
-  USBIP_HOST_BIN     Path to the release host example
+  USBIP_HOST_BIN     Path to the release usbipd binary
   USBIP_VID          Default vendor ID
   USBIP_PID          Default product ID
   USBIP_SERIAL       Default serial number
@@ -84,20 +84,22 @@ fi
 
 if [[ ! -x "$host_bin" ]]; then
     echo "host binary not found or not executable: $host_bin" >&2
-    echo "build it with: cargo build --release --example host" >&2
+    echo "build it with: cargo build --release --bin usbipd" >&2
     exit 1
 fi
 
 if ((stop_adb)); then
-    if command -v adb >/dev/null 2>&1; then
-        adb kill-server >/dev/null 2>&1 || true
-    else
-        echo "warning: --stop-adb was requested, but adb was not found" >&2
+    if ! command -v adb >/dev/null 2>&1; then
+        echo 'warning: adb not found; continuing without stopping ADB' >&2
+    elif ! adb kill-server; then
+        echo 'warning: adb kill-server failed; continuing anyway' >&2
     fi
 fi
 
 if ((use_sudo)); then
-    exec sudo "$host_bin" --vid "$vid" --pid "$pid" --serial "$serial" --listen "$listen"
+    cmd=(sudo "$host_bin" bind --vid "$vid" --pid "$pid" --serial "$serial" --listen "$listen")
 else
-    exec "$host_bin" --vid "$vid" --pid "$pid" --serial "$serial" --listen "$listen"
+    cmd=("$host_bin" bind --vid "$vid" --pid "$pid" --serial "$serial" --listen "$listen")
 fi
+
+exec "${cmd[@]}"

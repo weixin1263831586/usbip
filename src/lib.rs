@@ -137,7 +137,7 @@ impl UsbIpServer {
                 path: format!("/sys/bus/{}/{}/{}", bus_num_val, device_address, 0),
                 bus_id: format!("{}-{}-{}", bus_num_val, device_address, 0),
                 bus_num: bus_num_val,
-                dev_num: 0,
+                dev_num: device_address as u32,
                 speed: device_info.speed().unwrap() as u32,
                 vendor_id: device_info.vendor_id(),
                 product_id: device_info.product_id(),
@@ -281,7 +281,10 @@ impl UsbIpServer {
                     dev.port_number()
                 ),
                 bus_num: dev.bus_number() as u32,
-                dev_num: dev.port_number() as u32,
+                // USB/IP's devnum is the USB device address, not the
+                // physical hub port. The latter is already the third part
+                // of bus_id (for example, bus-address-port: 1-11-13).
+                dev_num: dev.address() as u32,
                 speed: rusb_speed_to_usbip(dev.speed()),
                 vendor_id: desc.vendor_id(),
                 product_id: desc.product_id(),
@@ -395,6 +398,11 @@ impl UsbIpServer {
 
     pub async fn add_device(&self, device: UsbDevice) {
         self.available_devices.write().await.push(device);
+    }
+
+    /// Return the number of devices currently available for import.
+    pub async fn available_device_count(&self) -> usize {
+        self.available_devices.read().await.len()
     }
 
     pub async fn remove_device(&self, bus_id: &str) -> Result<()> {
@@ -764,7 +772,15 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
 
 /// Spawn a USB/IP server at `addr` using [TcpListener]
 pub async fn server(addr: SocketAddr, server: Arc<UsbIpServer>) {
-    let listener = TcpListener::bind(addr).await.expect("bind to addr");
+    try_server(addr, server).await.expect("bind to addr");
+}
+
+/// Try to spawn a USB/IP server at `addr` using [TcpListener].
+///
+/// This variant returns bind errors to the caller so command-line frontends
+/// can report an occupied port without panicking.
+pub async fn try_server(addr: SocketAddr, server: Arc<UsbIpServer>) -> Result<()> {
+    let listener = TcpListener::bind(addr).await?;
 
     let server = async move {
         loop {
@@ -784,7 +800,8 @@ pub async fn server(addr: SocketAddr, server: Arc<UsbIpServer>) {
         }
     };
 
-    server.await
+    server.await;
+    Ok(())
 }
 
 #[cfg(test)]

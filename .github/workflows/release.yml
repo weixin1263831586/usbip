@@ -22,19 +22,26 @@ jobs:
           sudo apt-get install -y libusb-1.0-0-dev pkg-config
 
       - name: Build usbipd
-        run: cargo build --locked --release --bin usbipd
+        run: cargo build --release --bin usbipd
 
       - name: Prepare release files
         run: |
           cp target/release/usbipd usbipd-linux-x86_64
           sha256sum usbipd-linux-x86_64 > usbipd-linux-x86_64.sha256
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            usbipd-linux-x86_64 \
-            usbipd-linux-x86_64.sha256 \
-            --generate-notes \
-            --title "$GITHUB_REF_NAME"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              usbipd-linux-x86_64 \
+              usbipd-linux-x86_64.sha256 \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              usbipd-linux-x86_64 \
+              usbipd-linux-x86_64.sha256 \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi

@@ -76,9 +76,13 @@ impl HostDeviceRuntime {
         let devices = rusb::devices().map_err(Error::other)?;
         for device in devices.iter() {
             let descriptor = device.device_descriptor().map_err(Error::other)?;
-            if descriptor.vendor_id() != self.vendor_id
-                || descriptor.product_id() != self.product_id
-            {
+            if descriptor.vendor_id() != self.vendor_id {
+                continue;
+            }
+            // Android gadgets may change PID when switching from ADB to
+            // fastboot. A non-empty serial is the stable identity; devices
+            // without a serial must retain the original VID/PID match.
+            if self.serial.is_empty() && descriptor.product_id() != self.product_id {
                 continue;
             }
             let handle = match device.open() {

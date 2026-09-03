@@ -1,0 +1,5 @@
+[toolchain]
+# 固定工具链：CI 不再长期漂移 stable/nightly（2026-09-03 审计第六节）。
+# 升级时显式修改此文件并同步更新 tools/usbipd.provenance.json 的 rustc 字段。
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

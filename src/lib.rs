@@ -8,12 +8,13 @@ use rusb::*;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Result};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use usbip_protocol::UsbIpCommand;
 
 #[cfg(feature = "serde")]
@@ -437,6 +438,16 @@ struct CompletedSubmit {
     response: UsbIpResponse,
 }
 
+impl Clone for CompletedSubmit {
+    fn clone(&self) -> Self {
+        Self {
+            seqnum: self.seqnum,
+            status: self.status,
+            response: self.response.clone(),
+        }
+    }
+}
+
 struct PendingUrb {
     cancellation: Arc<async_transfer::TransferCancellation>,
     unlink_header: Option<usbip_protocol::UsbIpHeaderBasic>,
@@ -604,14 +615,56 @@ async fn process_submit(
     }
 }
 
+/// Maximum concurrently handled TCP connections (device import sessions).
+pub const MAX_CONNECTIONS: usize = 32;
+
+/// Maximum URBs in flight for a single connection.
+pub const MAX_PENDING_URBS: usize = 256;
+
+/// Idle timeout applied while waiting for the next USB/IP command.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Server-side accept policy and resource limits.
+#[derive(Clone, Debug, Default)]
+pub struct ServerOptions {
+    /// When non-empty, only peers with these IP addresses may connect.
+    pub allow_clients: Vec<IpAddr>,
+}
+
+impl ServerOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn allow_client(mut self, ip: IpAddr) -> Self {
+        self.allow_clients.push(ip);
+        self
+    }
+
+    fn client_allowed(&self, peer: SocketAddr) -> bool {
+        self.allow_clients.is_empty() || self.allow_clients.contains(&peer.ip())
+    }
+}
+
 pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     socket: &mut T,
     server: Arc<UsbIpServer>,
 ) -> Result<()> {
+    handler_with_options(socket, server, &ServerOptions::default()).await
+}
+
+pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
+    socket: &mut T,
+    server: Arc<UsbIpServer>,
+    _options: &ServerOptions,
+) -> Result<()> {
     let mut current_import_device_id: Option<String> = None;
     let mut current_import_device: Option<UsbDevice> = None;
     let mut pending_urbs: HashMap<u32, PendingUrb> = HashMap::new();
-    let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    // bounded channel: a flooding completion stream cannot grow without
+    // backpressure; senders retry after a short yield instead of unbounded
+    // memory growth.
+    let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedSubmit>(MAX_PENDING_URBS);
     let (mut reader, mut writer) = tokio::io::split(socket);
 
     loop {
@@ -634,7 +687,7 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 }
                 continue;
             }
-            command = UsbIpCommand::read_from_socket(&mut reader) => {
+                    command = UsbIpCommand::read_from_socket_timeout(&mut reader, Some(COMMAND_TIMEOUT)) => {
                 let command = match command {
                     Ok(command) => command,
                     Err(err) => {
@@ -728,6 +781,12 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 format!("duplicate USB/IP sequence number {seqnum}"),
                             ));
                         }
+                        if pending_urbs.len() >= MAX_PENDING_URBS {
+                            return Err(std::io::Error::new(
+                                ErrorKind::OutOfMemory,
+                                format!("too many pending URBs (limit {MAX_PENDING_URBS})"),
+                            ));
+                        }
 
                         let cancellation = Arc::new(async_transfer::TransferCancellation::default());
                         pending_urbs.insert(
@@ -740,7 +799,19 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                         let sender = completed_tx.clone();
                         tokio::spawn(async move {
                             let completed = process_submit(device, command, cancellation).await;
-                            let _ = sender.send(completed);
+                            // bounded channel: retry on full instead of
+                            // panicking or growing memory without bound.
+                            let mut backoff = 1;
+                            loop {
+                                match sender.try_send(completed.clone()) {
+                                    Ok(()) => break,
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tokio::time::sleep(Duration::from_millis(backoff)).await;
+                                        backoff = (backoff * 2).min(50);
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
+                            }
                         });
                     }
                     UsbIpCommand::UsbIpCmdUnlink {
@@ -780,16 +851,39 @@ pub async fn server(addr: SocketAddr, server: Arc<UsbIpServer>) {
 /// This variant returns bind errors to the caller so command-line frontends
 /// can report an occupied port without panicking.
 pub async fn try_server(addr: SocketAddr, server: Arc<UsbIpServer>) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    try_server_with_options(addr, server, ServerOptions::default()).await
+}
 
-    let server = async move {
+/// Try to spawn a USB/IP server with an accept policy (client allowlist) and
+/// resource limits (connection cap, per-connection idle timeout).
+pub async fn try_server_with_options(
+    addr: SocketAddr,
+    server: Arc<UsbIpServer>,
+    options: ServerOptions,
+) -> Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    // Cap concurrent connections so idle peers cannot exhaust tasks/memory.
+    let connection_semaphores = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let options = Arc::new(options);
+
+    let accept_loop = async move {
         loop {
             match listener.accept().await {
-                Ok((mut socket, _addr)) => {
-                    info!("Got connection from {:?}", socket.peer_addr());
+                Ok((mut socket, peer_addr)) => {
+                    if !options.client_allowed(peer_addr) {
+                        warn!("Rejected connection from non-allowlisted peer {peer_addr}");
+                        continue;
+                    }
+                    let permit = match connection_semaphores.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    };
+                    info!("Got connection from {:?}", peer_addr);
                     let new_server = server.clone();
+                    let new_options = options.clone();
                     tokio::spawn(async move {
-                        let res = handler(&mut socket, new_server).await;
+                        let _permit = permit;
+                        let res = handler_with_options(&mut socket, new_server, &new_options).await;
                         info!("Handler ended with {res:?}");
                     });
                 }
@@ -800,7 +894,7 @@ pub async fn try_server(addr: SocketAddr, server: Arc<UsbIpServer>) -> Result<()
         }
     };
 
-    server.await;
+    accept_loop.await;
     Ok(())
 }
 

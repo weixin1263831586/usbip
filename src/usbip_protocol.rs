@@ -7,8 +7,21 @@
 //! They are based on the [Linux kernel documentation](https://docs.kernel.org/usb/usbip_protocol.html).
 
 use log::trace;
-use std::io::Result;
+use std::io::{ErrorKind, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Maximum accepted ``transfer_buffer_length`` for a single URB.
+///
+/// The value comes straight off the network, so it must be bounded before any
+/// allocation; otherwise a malicious client can request multi-gigabyte
+/// ``Vec`` allocations and OOM the server.
+pub const MAX_TRANSFER_BUFFER_LENGTH: u32 = 16 * 1024 * 1024;
+
+/// Maximum accepted ``number_of_packets`` for ISO transfers.
+pub const MAX_NUMBER_OF_PACKETS: u32 = 4096;
+
+/// Size in bytes of each ISO packet descriptor on the wire.
+const ISO_PACKET_DESCRIPTOR_SIZE: usize = 16;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -79,6 +92,43 @@ impl UsbIpHeaderBasic {
         result
     }
 
+    /// Returns the validated direction flag (0=OUT, 1=IN) or an error.
+    ///
+    /// Struct literal construction cannot fail, so call sites that receive
+    /// network-controlled headers must call this instead of relying on
+    /// ``debug_assert!`` only.
+    pub fn validated_direction(&self) -> Result<u32> {
+        if self.direction & 1 != self.direction {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid direction: {}", self.direction),
+            ));
+        }
+        Ok(self.direction)
+    }
+
+    /// Validate protocol-invariant fields that come off the network.
+    ///
+    /// Release builds must reject malformed input too, not only debug builds
+    /// (previously these were only ``debug_assert!``s).
+    fn validate(&self) -> Result<()> {
+        if self.direction & 1 != self.direction {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid direction: {}", self.direction),
+            ));
+        }
+        // Endpoint number is a 4-bit field in USB; the network value is
+        // truncated to u8 further down the stack, so reject anything wider.
+        if self.ep > 15 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid endpoint number: {}", self.ep),
+            ));
+        }
+        Ok(())
+    }
+
     /// Converts the [UsbIpHeaderBasic] into a byte array.
     pub fn to_bytes(&self) -> [u8; 20] {
         let mut result = [0u8; 20];
@@ -97,17 +147,19 @@ impl UsbIpHeaderBasic {
         let seqnum = socket.read_u32().await?;
         let devid = socket.read_u32().await?;
         let direction = socket.read_u32().await?;
-        // The direction should be 0 or 1
-        debug_assert!(direction & 1 == direction);
+        // The direction should be 0 or 1; enforced below via validate() so
+        // release builds reject malformed input too (was debug_assert only).
         let ep = socket.read_u32().await?;
 
-        Ok(UsbIpHeaderBasic {
+        let header = UsbIpHeaderBasic {
             command: command.into(),
             seqnum,
             devid,
             direction,
             ep,
-        })
+        };
+        header.validate()?;
+        Ok(header)
     }
 }
 
@@ -145,6 +197,33 @@ impl UsbIpCommand {
     /// This will consume a variable amount of bytes from the socket.
     /// It might fail if the bytes does not follow the USB/IP protocol properly.
     pub async fn read_from_socket<T: AsyncReadExt + Unpin>(socket: &mut T) -> Result<UsbIpCommand> {
+        Self::read_from_socket_timeout(socket, None).await
+    }
+
+    /// Same as [UsbIpCommand::read_from_socket] with an overall deadline:
+    /// the first byte of the command must arrive within `timeout`, and the
+    /// remaining fields must keep streaming. Prevents idle peers from
+    /// holding connections/devices forever.
+    pub async fn read_from_socket_timeout<T: AsyncReadExt + Unpin>(
+        socket: &mut T,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<UsbIpCommand> {
+        match timeout {
+            Some(deadline) => tokio::time::timeout(deadline, Self::read_from_socket_inner(socket))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for USB/IP command",
+                    ))
+                }),
+            None => Self::read_from_socket_inner(socket).await,
+        }
+    }
+
+    async fn read_from_socket_inner<T: AsyncReadExt + Unpin>(
+        socket: &mut T,
+    ) -> Result<UsbIpCommand> {
         let version: u16 = socket.read_u16().await?;
 
         if version != 0 && version != USBIP_VERSION {
@@ -192,6 +271,29 @@ impl UsbIpCommand {
                 let number_of_packets = socket.read_u32().await?;
                 let interval = socket.read_u32().await?;
 
+                // Allocation bounds come from the network, so enforce them
+                // before any Vec allocation. Without these a client could
+                // request multi-gigabyte buffers (OOM) directly.
+                if transfer_buffer_length > MAX_TRANSFER_BUFFER_LENGTH {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "transfer_buffer_length {transfer_buffer_length} exceeds limit {MAX_TRANSFER_BUFFER_LENGTH}"
+                        ),
+                    ));
+                }
+                if number_of_packets != 0
+                    && number_of_packets != 0xFFFFFFFF
+                    && number_of_packets > MAX_NUMBER_OF_PACKETS
+                {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "number_of_packets {number_of_packets} exceeds limit {MAX_NUMBER_OF_PACKETS}"
+                        ),
+                    ));
+                }
+
                 let mut setup = [0; 8];
                 socket.read_exact(&mut setup).await?;
 
@@ -208,7 +310,17 @@ impl UsbIpCommand {
                 // https://stackoverflow.com/questions/76899798/usb-ip-what-is-the-size-of-the-iso-packet-descriptor
                 let iso_packet_descriptor =
                     if number_of_packets != 0 && number_of_packets != 0xFFFFFFFF {
-                        let mut result = vec![0; 16 * number_of_packets as usize];
+                        // checked_mul: never compute the allocation size with
+                        // a raw multiply of network-supplied values.
+                        let total = ISO_PACKET_DESCRIPTOR_SIZE
+                            .checked_mul(number_of_packets as usize)
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    ErrorKind::InvalidData,
+                                    "ISO packet descriptor size overflow",
+                                )
+                            })?;
+                        let mut result = vec![0; total];
                         socket.read_exact(&mut result).await?;
                         result
                     } else {
@@ -980,6 +1092,81 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "Unknown command: 0x1005".to_string()
+        );
+    }
+
+    fn submit_with(buffer_length: u32, number_of_packets: u32) -> Vec<u8> {
+        // direction In → no data section on the wire.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&USBIP_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&USBIP_CMD_SUBMIT.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // seqnum
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // devid
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // direction = In
+        bytes.extend_from_slice(&4u32.to_be_bytes()); // ep
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // transfer_flags
+        bytes.extend_from_slice(&buffer_length.to_be_bytes()); // transfer_buffer_length
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // start_frame
+        bytes.extend_from_slice(&number_of_packets.to_be_bytes()); // number_of_packets
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // interval
+        bytes.extend_from_slice(&[0u8; 8]); // setup
+        bytes
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_oversized_transfer_buffer() {
+        setup_test_logger();
+        let bytes = submit_with(MAX_TRANSFER_BUFFER_LENGTH + 1, 0);
+        let mut socket = MockSocket::new(bytes);
+        let result = UsbIpCommand::read_from_socket(&mut socket).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds limit"));
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_oversized_iso_packet_count() {
+        setup_test_logger();
+        let bytes = submit_with(0, MAX_NUMBER_OF_PACKETS + 1);
+        let mut socket = MockSocket::new(bytes);
+        let result = UsbIpCommand::read_from_socket(&mut socket).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds limit"));
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_invalid_direction() {
+        setup_test_logger();
+        let bytes = submit_with(0, 0);
+        let mut bytes = bytes;
+        // direction field at offset 4 (version+command) + 4 (seqnum) + 4 (devid)
+        let offset = 2 + 2 + 4 + 4;
+        bytes[offset..offset + 4].copy_from_slice(&7u32.to_be_bytes());
+        let mut socket = MockSocket::new(bytes);
+        let result = UsbIpCommand::read_from_socket(&mut socket).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid direction")
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_oversized_endpoint() {
+        setup_test_logger();
+        let bytes = submit_with(0, 0);
+        let mut bytes = bytes;
+        let offset = 2 + 2 + 4 + 4 + 4;
+        bytes[offset..offset + 4].copy_from_slice(&300u32.to_be_bytes());
+        let mut socket = MockSocket::new(bytes);
+        let result = UsbIpCommand::read_from_socket(&mut socket).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid endpoint number")
         );
     }
 }

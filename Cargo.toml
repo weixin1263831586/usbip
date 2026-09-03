@@ -1,6 +1,6 @@
 [package]
 name = "usbip"
-version = "0.9.2"
+version = "0.9.3"
 authors = ["Jiajie Chen <c@jia.je>"]
 edition = "2024"
 license = "MIT"
@@ -10,7 +10,7 @@ description = "A library to run USB/IP server"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.22.0", features = ["rt", "net", "io-util", "sync", "macros"] }
+tokio = { version = "1.22.0", features = ["rt", "net", "io-util", "sync", "macros", "time"] }
 log = "0.4.17"
 num-traits = "0.2.15"
 num-derive = "0.5.1"

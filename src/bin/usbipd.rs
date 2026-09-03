@@ -4,8 +4,12 @@ use std::sync::Arc;
 
 fn usage() {
     eprintln!(
-        "Usage:\n  usbipd bind --serial SERIAL [--vid HEX] [--pid HEX] [--listen ADDR] [--stop-adb]\n  usbipd --version\n  usbipd help"
+        "Usage:\n  usbipd bind [--serial SERIAL]... [--vid HEX]... [--pid HEX]... [--listen ADDR] [--stop-adb]\n  usbipd --version\n  usbipd help"
     );
+    eprintln!(
+        "\nOptions are repeatable; a device matches when it passes every provided filter set."
+    );
+    eprintln!("At least one of --serial/--vid/--pid is required.");
     eprintln!("\nDefault listen address: 0.0.0.0:3240");
 }
 
@@ -15,6 +19,13 @@ fn option_value(args: &[String], name: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
+fn option_values(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
 fn parse_hex(value: &str, name: &str) -> u16 {
     u16::from_str_radix(value.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or_else(
         |_| {
@@ -22,14 +33,6 @@ fn parse_hex(value: &str, name: &str) -> u16 {
             std::process::exit(2);
         },
     )
-}
-
-fn required_option(args: &[String], name: &str) -> String {
-    option_value(args, name).unwrap_or_else(|| {
-        eprintln!("missing required option: {name}");
-        usage();
-        std::process::exit(2);
-    })
 }
 
 fn stop_adb_server() {
@@ -53,9 +56,23 @@ fn stop_adb_server() {
 }
 
 fn run_bind(args: &[String]) {
-    let serial = required_option(args, "--serial");
-    let vid = option_value(args, "--vid").map(|value| parse_hex(&value, "--vid"));
-    let pid = option_value(args, "--pid").map(|value| parse_hex(&value, "--pid"));
+    let serials = option_values(args, "--serial")
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    let vids = option_values(args, "--vid")
+        .into_iter()
+        .map(|value| parse_hex(&value, "--vid"))
+        .collect::<Vec<_>>();
+    let pids = option_values(args, "--pid")
+        .into_iter()
+        .map(|value| parse_hex(&value, "--pid"))
+        .collect::<Vec<_>>();
+    if serials.is_empty() && vids.is_empty() && pids.is_empty() {
+        eprintln!("at least one of --serial/--vid/--pid is required");
+        usage();
+        std::process::exit(2);
+    }
     let listen = option_value(args, "--listen")
         .unwrap_or_else(|| "0.0.0.0:3240".to_string())
         .parse::<SocketAddr>()
@@ -74,16 +91,19 @@ fn run_bind(args: &[String]) {
             let Ok(descriptor) = device.device_descriptor() else {
                 return false;
             };
-            if vid.is_some_and(|expected| descriptor.vendor_id() != expected)
-                || pid.is_some_and(|expected| descriptor.product_id() != expected)
-            {
+            if !vids.is_empty() && !vids.contains(&descriptor.vendor_id()) {
                 return false;
             }
-
+            if !pids.is_empty() && !pids.contains(&descriptor.product_id()) {
+                return false;
+            }
+            if serials.is_empty() {
+                return true;
+            }
             device
                 .open()
                 .and_then(|handle| handle.read_serial_number_string_ascii(&descriptor))
-                .is_ok_and(|device_serial| device_serial == serial)
+                .is_ok_and(|device_serial| serials.iter().any(|s| s == &device_serial))
         },
     ));
 

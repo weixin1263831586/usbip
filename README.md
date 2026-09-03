@@ -22,6 +22,21 @@ Ubuntu 原生的 `usbip-host.ko` 并不是完全不能导出 USB，键盘、鼠�
 
 本项目使用用户态 libusb 转发，不让 `usbip-host.ko` 接管整个物理设备，因此更适合 Android 设备。客户端仍然需要 `vhci-hcd`，这两者不是同一个实现。
 
+## 开发
+
+常用编译和检查命令：
+
+| 用途 | 命令 |
+| --- | --- |
+| 调试编译（默认） | `cargo build` |
+| 发布编译 `usbipd` 服务端 | `cargo build --release --bin usbipd` |
+| 编译全部目标（含示例） | `cargo build --release --all-targets` |
+| 只做语法/类型检查，不产出文件 | `cargo check` |
+| 运行测试（CI 检查项） | `cargo test` |
+| 格式检查（CI 检查项） | `cargo fmt --check` |
+
+项目也保留模拟 HID 和 CDC ACM 设备示例，可用于测试 USB/IP 协议本身。
+
 ## 两台主机的角色
 
 | 主机 | 操作 |
@@ -94,11 +109,18 @@ usbipd bind \
 
 参数说明：
 
-- `--serial`：必填，选择要导出的设备；
-- `--vid`、`--pid`：可选，用于进一步限制设备；
+- `--serial`：可重复，选择要导出的设备序列号，可一次导出多台；
+- `--vid`、`--pid`：可选、可重复，用于进一步限制设备；不填 `--serial` 时至少提供一个 `--vid` 或 `--pid`；
 - `--stop-adb`：先停止当前用户的 ADB；
 - 默认监听 `0.0.0.0:3240`；
-- 按 `Ctrl-C` 停止服务。
+- 前台运行时按 `Ctrl-C` 停止服务。
+
+例如一次导出两台设备，或按厂商导出：
+
+```bash
+usbipd bind --stop-adb --serial SERIAL_A --serial SERIAL_B
+usbipd bind --stop-adb --vid 2207 --vid 18d1
+```
 
 如果 CTS、GMS Worker 或其他后台任务会自动启动 ADB，单次 `--stop-adb` 可能不够，需要先暂停会自动拉起 ADB 的任务。
 
@@ -109,6 +131,28 @@ cannot connect to daemon at tcp:5037: Connection refused
 ```
 
 表示 ADB 本来就没有运行，可以忽略，USB/IP 服务仍会继续启动。
+
+### 4. 后台运行（简单方式）
+
+不想一直占用终端时，使用 `nohup`：
+
+```bash
+nohup usbipd bind \
+  --stop-adb \
+  --vid 2207 \
+  --pid 0006 \
+  --serial YOUR_USB_SERIAL \
+  >"$HOME/usbipd.log" 2>&1 </dev/null &
+```
+
+查看进程和日志：
+
+```bash
+pgrep -af usbipd
+tail -f "$HOME/usbipd.log"
+```
+
+`nohup` 适合后台运行和测试使用。需要开机自动启动、异常退出自动重启时，再根据实际环境配置 systemd。
 
 ## Linux 客户端使用
 
@@ -212,15 +256,6 @@ usbipd bind --listen 0.0.0.0:3241 --serial YOUR_SERIAL
 ```bash
 sudo usbip attach -r 172.16.14.246 -b BUSID
 ```
-
-## 开发
-
-```bash
-cargo test
-cargo fmt --check
-```
-
-项目也保留模拟 HID 和 CDC ACM 设备示例，可用于测试 USB/IP 协议本身。
 
 ## 许可证
 

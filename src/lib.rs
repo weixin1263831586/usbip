@@ -781,6 +781,23 @@ pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 format!("duplicate USB/IP sequence number {seqnum}"),
                             ));
                         }
+                        // Protocol invariant: devid must reference the
+                        // currently imported device ((bus << 16) | devnum).
+                        // A mismatched devid means a hostile/broken client.
+                        let expected_devid =
+                            (device.bus_num << 16) | device.dev_num;
+                        let header_devid = match &command {
+                            UsbIpCommand::UsbIpCmdSubmit { header, .. } => header.devid,
+                            _ => unreachable!(),
+                        };
+                        if header_devid != expected_devid {
+                            return Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                format!(
+                                    "devid {header_devid:#x} does not match imported device {expected_devid:#x}"
+                                ),
+                            ));
+                        }
                         if pending_urbs.len() >= MAX_PENDING_URBS {
                             return Err(std::io::Error::new(
                                 ErrorKind::OutOfMemory,

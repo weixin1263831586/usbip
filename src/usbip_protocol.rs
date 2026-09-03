@@ -249,13 +249,23 @@ impl UsbIpCommand {
         match command {
             OP_REQ_DEVLIST => {
                 let status = socket.read_u32().await?;
-                debug_assert!(status == 0);
+                if status != 0 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("OP_REQ_DEVLIST status must be 0, got {status}"),
+                    ));
+                }
 
                 Ok(UsbIpCommand::OpReqDevlist { status })
             }
             OP_REQ_IMPORT => {
                 let status = socket.read_u32().await?;
-                debug_assert!(status == 0);
+                if status != 0 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("OP_REQ_IMPORT status must be 0, got {status}"),
+                    ));
+                }
                 let mut busid = [0; 32];
                 socket.read_exact(&mut busid).await?;
 

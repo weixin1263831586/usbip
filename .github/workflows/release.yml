@@ -10,7 +10,12 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Pinned to ubuntu-22.04: the bundled binary is auto-deployed to Ubuntu
+    # 22.04 source hosts (glibc 2.35). ubuntu-latest (24.04, glibc 2.39)
+    # produces binaries that fail on those hosts with
+    # "GLIBC_2.39 not found". Bump only when the oldest supported source
+    # host OS moves up.
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout

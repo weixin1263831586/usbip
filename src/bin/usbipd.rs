@@ -184,9 +184,7 @@ fn run_bind(args: &[String]) {
     // the exported USB devices to the whole network; callers that truly
     // want that must pass --allow-any-client explicitly.
     if !listen.ip().is_loopback() && allow_clients.is_empty() && !allow_any_client {
-        eprintln!(
-            "拒绝启动：监听非回环地址 {listen} 且未配置 --allow-client。"
-        );
+        eprintln!("拒绝启动：监听非回环地址 {listen} 且未配置 --allow-client。");
         eprintln!(
             "USB/IP 3240 将向整个可达网络暴露被导出的 USB 设备；请追加 --allow-client IP 限制客户端，\n或在完全可信网络下显式使用 --allow-any-client。"
         );

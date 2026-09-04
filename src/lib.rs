@@ -1279,7 +1279,10 @@ mod tests {
             data: vec![],
             iso_packet_descriptor: vec![],
         };
-        connection.write_all(bad_submit.to_bytes().as_slice()).await.unwrap();
+        connection
+            .write_all(bad_submit.to_bytes().as_slice())
+            .await
+            .unwrap();
         let _ = connection.read_u32().await;
 
         // The device must be back in the available pool despite the error.

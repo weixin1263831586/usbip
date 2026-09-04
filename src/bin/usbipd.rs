@@ -6,7 +6,7 @@ use usbip::ServerOptions;
 
 fn usage() {
     eprintln!(
-        "Usage:\n  usbipd bind [--serial SERIAL]... [--vid HEX]... [--pid HEX]... [--device VID:PID]... [--listen ADDR] [--allow-client IP]... [--stop-adb]\n  usbipd --version\n  usbipd help"
+        "Usage:\n  usbipd bind [--serial SERIAL]... [--vid HEX]... [--pid HEX]... [--device VID:PID]... [--listen ADDR] [--allow-client IP]... [--allow-any-client] [--stop-adb]\n  usbipd --version\n  usbipd help"
     );
     eprintln!(
         "\nOptions are repeatable; --serial/--vid/--pid are independent filter sets while\n--device VID:PID matches exact (vendor, product) pairs."
@@ -16,7 +16,10 @@ fn usage() {
         "\nDefault listen address: 127.0.0.1:3240 (loopback only; pass --listen to expose a LAN/Tailscale interface)."
     );
     eprintln!(
-        "--allow-client restricts TCP peers to the given IPs (repeatable, empty = allow all)."
+        "--allow-client restricts TCP peers to the given IPs (repeatable; loopback is always allowed)."
+    );
+    eprintln!(
+        "--allow-any-client accepts non-loopback peers without an allowlist (fail-closed override, use only on trusted networks)."
     );
 }
 
@@ -123,6 +126,10 @@ fn run_bind(args: &[String]) {
         });
         options = options.allow_client(ip);
     }
+    let allow_any_client = args.iter().any(|arg| arg == "--allow-any-client");
+    if allow_any_client {
+        options = options.with_allow_any_client(true);
+    }
     let stop_adb = args.iter().any(|arg| arg == "--stop-adb");
 
     if stop_adb {
@@ -171,15 +178,25 @@ fn run_bind(args: &[String]) {
         }
     }
 
-    if listen.ip().is_unspecified() && allow_clients.is_empty() {
+    // Fail-closed (P0): binding a non-loopback interface without an
+    // allowlist must refuse to start. Previously an empty allowlist meant
+    // "allow every client", so a misconfigured deployment silently exposed
+    // the exported USB devices to the whole network; callers that truly
+    // want that must pass --allow-any-client explicitly.
+    if !listen.ip().is_loopback() && allow_clients.is_empty() && !allow_any_client {
         eprintln!(
-            "warning: 监听 {listen} 且未配置 --allow-client，任何可达该地址的主机都可访问被导出的 USB 设备。"
+            "拒绝启动：监听非回环地址 {listen} 且未配置 --allow-client。"
         );
-        eprintln!("建议使用 --listen 指定可信接口，或追加 --allow-client 限制客户端 IP。");
+        eprintln!(
+            "USB/IP 3240 将向整个可达网络暴露被导出的 USB 设备；请追加 --allow-client IP 限制客户端，\n或在完全可信网络下显式使用 --allow-any-client。"
+        );
+        std::process::exit(2);
     }
 
     println!("USB/IP server listening on {listen}");
-    if !allow_clients.is_empty() {
+    if allow_any_client {
+        println!("Client allowlist: ANY (fail-closed override)");
+    } else if !allow_clients.is_empty() {
         println!("Allowed clients: {}", allow_clients.join(", "));
     }
     println!("Press Ctrl-C to stop.");

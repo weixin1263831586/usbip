@@ -624,11 +624,19 @@ pub const MAX_PENDING_URBS: usize = 256;
 /// Idle timeout applied while waiting for the next USB/IP command.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Hard deadline for draining cancelled/in-flight URBs after the peer went
+/// away. A wedged host-side cancellation must not pin the exported device
+/// forever; late completions after the deadline are dropped.
+pub const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Server-side accept policy and resource limits.
 #[derive(Clone, Debug, Default)]
 pub struct ServerOptions {
     /// When non-empty, only peers with these IP addresses may connect.
     pub allow_clients: Vec<IpAddr>,
+    /// Explicitly accept clients from any address (fail-closed override,
+    /// set by `--allow-any-client`). Loopback peers are always accepted.
+    pub allow_any_client: bool,
 }
 
 impl ServerOptions {
@@ -641,8 +649,18 @@ impl ServerOptions {
         self
     }
 
+    pub fn with_allow_any_client(mut self, allow: bool) -> Self {
+        self.allow_any_client = allow;
+        self
+    }
+
     fn client_allowed(&self, peer: SocketAddr) -> bool {
-        self.allow_clients.is_empty() || self.allow_clients.contains(&peer.ip())
+        // Local tooling (usbip list via an SSH tunnel, diagnostics) talks
+        // from loopback; it is trusted regardless of the allowlist.
+        if peer.ip().is_loopback() {
+            return true;
+        }
+        self.allow_any_client || self.allow_clients.contains(&peer.ip())
     }
 }
 
@@ -658,14 +676,50 @@ pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     server: Arc<UsbIpServer>,
     _options: &ServerOptions,
 ) -> Result<()> {
-    let mut current_import_device_id: Option<String> = None;
+    let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedSubmit>(MAX_PENDING_URBS);
+    let (mut reader, mut writer) = tokio::io::split(socket);
+    let mut imported_device_id: Option<String> = None;
+    let result = handler_loop(
+        &mut reader,
+        &mut writer,
+        server.clone(),
+        completed_tx,
+        &mut completed_rx,
+        &mut imported_device_id,
+    )
+    .await;
+    // Unified device release (P0): the imported device is returned to the
+    // available pool on EVERY exit path — clean EOF, protocol violation,
+    // write failure, or task teardown — so a broken or malicious client can
+    // never soft-lock it as "in use" until daemon restart.
+    if let Some(dev_id) = imported_device_id.take() {
+        let mut used_devices = server.used_devices.write().await;
+        let mut available_devices = server.available_devices.write().await;
+        if let Some(dev) = used_devices.remove(&dev_id) {
+            info!("Released imported device {dev_id} back to available pool");
+            available_devices.push(dev);
+        }
+    }
+    result
+}
+
+async fn handler_loop<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    server: Arc<UsbIpServer>,
+    completed_tx: mpsc::Sender<CompletedSubmit>,
+    completed_rx: &mut mpsc::Receiver<CompletedSubmit>,
+    imported_device_id: &mut Option<String>,
+) -> Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let mut current_import_device: Option<UsbDevice> = None;
     let mut pending_urbs: HashMap<u32, PendingUrb> = HashMap::new();
     // bounded channel: a flooding completion stream cannot grow without
     // backpressure; senders retry after a short yield instead of unbounded
     // memory growth.
-    let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedSubmit>(MAX_PENDING_URBS);
-    let (mut reader, mut writer) = tokio::io::split(socket);
 
     loop {
         tokio::select! {
@@ -678,16 +732,16 @@ pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 };
                 if let Some(unlink_header) = pending.unlink_header {
                     UsbIpResponse::usbip_ret_unlink_result(&unlink_header, completed.status)
-                        .write_to_socket(&mut writer)
+                        .write_to_socket(writer)
                         .await?;
                     trace!("Sent USBIP_RET_UNLINK for {:x}", completed.seqnum);
                 } else {
-                    completed.response.write_to_socket(&mut writer).await?;
+                    completed.response.write_to_socket(writer).await?;
                     trace!("Sent USBIP_RET_SUBMIT for {:x}", completed.seqnum);
                 }
                 continue;
             }
-                    command = UsbIpCommand::read_from_socket_timeout(&mut reader, Some(COMMAND_TIMEOUT)) => {
+                    command = UsbIpCommand::read_from_socket_timeout(reader, Some(COMMAND_TIMEOUT)) => {
                 let command = match command {
                     Ok(command) => command,
                     Err(err) => {
@@ -696,32 +750,38 @@ pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                         }
                         // A TCP half-close means no more commands are coming,
                         // but the peer may still be waiting for replies. Drain
-                        // cancelled/completed URBs before releasing the device.
-                        while !pending_urbs.is_empty() {
-                            let Some(completed): Option<CompletedSubmit> = completed_rx.recv().await else {
-                                break;
-                            };
-                            let Some(pending) = pending_urbs.remove(&completed.seqnum) else {
-                                continue;
-                            };
-                            let response = if let Some(unlink_header) = pending.unlink_header {
-                                UsbIpResponse::usbip_ret_unlink_result(
-                                    &unlink_header,
-                                    completed.status,
-                                )
-                            } else {
-                                completed.response
-                            };
-                            if response.write_to_socket(&mut writer).await.is_err() {
-                                break;
+                        // cancelled/completed URBs before releasing the device —
+                        // bounded by a hard teardown deadline so a wedged
+                        // host-side cancellation cannot pin the device (or this
+                        // handler) forever; late completions are dropped.
+                        // Device release itself happens in the unified
+                        // handler_with_options cleanup on every exit path.
+                        let drain = async {
+                            while !pending_urbs.is_empty() {
+                                let Some(completed): Option<CompletedSubmit> = completed_rx.recv().await else {
+                                    break;
+                                };
+                                let Some(pending) = pending_urbs.remove(&completed.seqnum) else {
+                                    continue;
+                                };
+                                let response = if let Some(unlink_header) = pending.unlink_header {
+                                    UsbIpResponse::usbip_ret_unlink_result(
+                                        &unlink_header,
+                                        completed.status,
+                                    )
+                                } else {
+                                    completed.response
+                                };
+                                if response.write_to_socket(writer).await.is_err() {
+                                    break;
+                                }
                             }
-                        }
-                        if let Some(dev_id) = current_import_device_id.take() {
-                            let mut used_devices = server.used_devices.write().await;
-                            let mut available_devices = server.available_devices.write().await;
-                            if let Some(dev) = used_devices.remove(&dev_id) {
-                                available_devices.push(dev);
-                            }
+                        };
+                        if tokio::time::timeout(TEARDOWN_TIMEOUT, drain).await.is_err() {
+                            warn!(
+                                "URB teardown exceeded {TEARDOWN_TIMEOUT:?}; forcing release ({} URBs dropped)",
+                                pending_urbs.len()
+                            );
                         }
                         if err.kind() == ErrorKind::UnexpectedEof {
                             info!("Remote closed the connection");
@@ -736,17 +796,25 @@ pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                         trace!("Got OP_REQ_DEVLIST");
                         let devices = server.available_devices.read().await;
                         UsbIpResponse::op_rep_devlist(&devices)
-                            .write_to_socket(&mut writer)
+                            .write_to_socket(writer)
                             .await?;
                         trace!("Sent OP_REP_DEVLIST");
                     }
                     UsbIpCommand::OpReqImport { busid, .. } => {
                         trace!("Got OP_REQ_IMPORT");
-                        current_import_device_id = None;
                         current_import_device = None;
 
                         let mut used_devices = server.used_devices.write().await;
                         let mut available_devices = server.available_devices.write().await;
+                        // Release a device previously imported by THIS
+                        // connection before switching: a second OP_REQ_IMPORT
+                        // must not leak the first device into used_devices
+                        // forever (unified cleanup only tracks the latest).
+                        if let Some(prev_id) = imported_device_id.take()
+                            && let Some(dev) = used_devices.remove(&prev_id)
+                        {
+                            available_devices.push(dev);
+                        }
                         let busid_compare =
                             &busid[..busid.iter().position(|&x| x == 0).unwrap_or(busid.len())];
                         if let Some(index) = available_devices
@@ -756,7 +824,7 @@ pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                             let device = available_devices.remove(index);
                             let dev_id = device.bus_id.clone();
                             current_import_device = Some(device.clone());
-                            current_import_device_id = Some(dev_id.clone());
+                            *imported_device_id = Some(dev_id.clone());
                             used_devices.insert(dev_id, device);
                         }
 
@@ -764,7 +832,7 @@ pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                             .as_ref()
                             .map(UsbIpResponse::op_rep_import_success)
                             .unwrap_or_else(UsbIpResponse::op_rep_import_fail);
-                        response.write_to_socket(&mut writer).await?;
+                        response.write_to_socket(writer).await?;
                         trace!("Sent OP_REP_IMPORT");
                     }
                     command @ UsbIpCommand::UsbIpCmdSubmit { .. } => {
@@ -843,12 +911,12 @@ pub async fn handler_with_options<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 pending.cancellation.cancel();
                             } else {
                                 UsbIpResponse::usbip_ret_unlink_result(&header, 0)
-                                    .write_to_socket(&mut writer)
+                                    .write_to_socket(writer)
                                     .await?;
                             }
                         } else {
                             UsbIpResponse::usbip_ret_unlink_result(&header, 0)
-                                .write_to_socket(&mut writer)
+                                .write_to_socket(writer)
                                 .await?;
                         }
                     }
@@ -1178,5 +1246,112 @@ mod tests {
         handler(&mut mock_socket, Arc::new(server)).await.ok();
         // OP_REQ_IMPORT + USBIP_CMD_SUBMIT + Device Descriptor
         assert_eq!(mock_socket.output.len(), 0x140 + 0x30 + 0x12);
+    }
+
+    #[tokio::test]
+    async fn device_gets_released_after_protocol_error() {
+        setup_test_logger();
+        let server_ = Arc::new(new_server_with_single_device());
+
+        let addr = get_free_address().await;
+        tokio::spawn(server(addr, server_.clone()));
+
+        let mut connection = poll_connect(addr).await;
+        let result = attach_device(&mut connection, SINGLE_DEVICE_BUSID).await;
+        assert_eq!(result, 0);
+
+        // Submit with a mismatched devid: handler must return an error, and
+        // the unified cleanup must still release the imported device.
+        let bad_submit = UsbIpCommand::UsbIpCmdSubmit {
+            header: UsbIpHeaderBasic {
+                command: USBIP_CMD_SUBMIT.into(),
+                seqnum: 1,
+                devid: 0xffff,
+                direction: 1, // IN
+                ep: 0,
+            },
+            transfer_flags: 0,
+            transfer_buffer_length: 0,
+            start_frame: 0,
+            number_of_packets: 0,
+            interval: 0,
+            setup: [0; 8],
+            data: vec![],
+            iso_packet_descriptor: vec![],
+        };
+        connection.write_all(bad_submit.to_bytes().as_slice()).await.unwrap();
+        let _ = connection.read_u32().await;
+
+        // The device must be back in the available pool despite the error.
+        let mut next = TcpStream::connect(addr).await.unwrap();
+        let result = attach_device(&mut next, SINGLE_DEVICE_BUSID).await;
+        assert_eq!(result, 0);
+    }
+
+    #[tokio::test]
+    async fn second_import_releases_previous_device() {
+        setup_test_logger();
+        let first_device = UsbDevice::new(0).with_interface(
+            ClassCode::CDC as u8,
+            cdc::CDC_ACM_SUBCLASS,
+            0x00,
+            Some("Test CDC ACM"),
+            cdc::UsbCdcAcmHandler::endpoints(),
+            Arc::new(Mutex::new(
+                Box::new(cdc::UsbCdcAcmHandler::new()) as Box<dyn UsbInterfaceHandler + Send>
+            )),
+        );
+        let mut second_device = UsbDevice::new(1).with_interface(
+            ClassCode::CDC as u8,
+            cdc::CDC_ACM_SUBCLASS,
+            0x00,
+            Some("Test CDC ACM 2"),
+            cdc::UsbCdcAcmHandler::endpoints(),
+            Arc::new(Mutex::new(
+                Box::new(cdc::UsbCdcAcmHandler::new()) as Box<dyn UsbInterfaceHandler + Send>
+            )),
+        );
+        second_device.bus_id = "0-0-1".to_string();
+        let server_ = Arc::new(UsbIpServer::new_simulated(vec![
+            first_device,
+            second_device,
+        ]));
+
+        let addr = get_free_address().await;
+        tokio::spawn(server(addr, server_.clone()));
+
+        let mut connection = poll_connect(addr).await;
+        assert_eq!(attach_device(&mut connection, "0-0-0").await, 0);
+        // Importing a second device on the SAME connection must not leak the
+        // first one into used_devices.
+        assert_eq!(attach_device(&mut connection, "0-0-1").await, 0);
+        std::mem::drop(connection);
+
+        // Both devices must be importable again by a fresh connection.
+        let mut next = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(attach_device(&mut next, "0-0-0").await, 0);
+        std::mem::drop(next);
+        let mut next = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(attach_device(&mut next, "0-0-1").await, 0);
+    }
+
+    #[test]
+    fn client_allowlist_is_fail_closed() {
+        use std::net::Ipv4Addr;
+
+        let peer = |ip: [u8; 4], port: u16| SocketAddr::from((Ipv4Addr::from(ip), port));
+
+        // Empty allowlist without the explicit override rejects non-loopback.
+        let options = ServerOptions::default();
+        assert!(!options.client_allowed(peer([192, 168, 1, 50], 3240)));
+        // Loopback is always trusted.
+        assert!(options.client_allowed(peer([127, 0, 0, 1], 3240)));
+        // Allowlisted peer passes, others are rejected.
+        let options = ServerOptions::new().allow_client(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)));
+        assert!(options.client_allowed(peer([192, 168, 1, 50], 9999)));
+        assert!(!options.client_allowed(peer([192, 168, 1, 51], 3240)));
+        // Explicit override accepts any non-loopback address too.
+        let options = ServerOptions::new().with_allow_any_client(true);
+        assert!(options.client_allowed(peer([10, 0, 0, 7], 3240)));
     }
 }

@@ -537,7 +537,42 @@ impl UsbIpResponse {
         }
     }
 
+    /// Validate response invariants before writing to the socket.
+    ///
+    /// Previously these were only ``debug_assert!``s, so a release build
+    /// could happily serialize an inconsistent RET_SUBMIT (e.g. OUT
+    /// direction with a non-empty transfer buffer).
+    fn validate(&self) -> Result<()> {
+        if let Self::UsbIpRetSubmit {
+            ref header,
+            actual_length,
+            ref transfer_buffer,
+            ..
+        } = *self
+        {
+            if header.direction == Direction::In as u32
+                && actual_length != transfer_buffer.len() as u32
+            {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "RET_SUBMIT IN actual_length {actual_length} != transfer_buffer len {}",
+                        transfer_buffer.len()
+                    ),
+                ));
+            }
+            if header.direction == Direction::Out as u32 && !transfer_buffer.is_empty() {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "RET_SUBMIT OUT must not carry a transfer buffer",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn write_to_socket<T: AsyncWriteExt + Unpin>(&self, socket: &mut T) -> Result<()> {
+        self.validate()?;
         socket.write_all(&self.to_bytes()).await
     }
 
@@ -856,7 +891,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn byte_serialize_invalid_usbip_ret_submit() {
         setup_test_logger();
         let res = UsbIpResponse::UsbIpRetSubmit {
@@ -876,7 +910,17 @@ mod tests {
             iso_packet_descriptor: vec![0xFF; 16],
         };
 
-        res.to_bytes();
+        // Invalid response must be rejected on EVERY path to the wire:
+        // debug builds panic via debug_assert!, release builds fail
+        // validation inside write_to_socket (was: silently serialized).
+        let result = res.validate();
+        assert!(result.is_err());
+        #[cfg(debug_assertions)]
+        {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                res.to_bytes();
+            }));
+        }
     }
 
     #[test]
